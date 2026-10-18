@@ -34,7 +34,7 @@ px4io: uarterrs: 1 events
 The `DMA errors` counter is **not proof** of traffic from the IOMCU. Neither failure counts nor the absence of CRC errors identify a single hardware root cause. The two remaining IMUs reported zero sensor error counts but temperatures rose together. A later sensor reading above 53 °C occurred after an **operator-initiated USB disconnect/reconnect**, not a spontaneous reboot. Physical heater state remains unknown.
 
 ## Documentation map
-
+- [ArduPilot Rover: IOMCU Isolation and IMU Thermal Experiments](docs/ARDUPILOT_ROVER_THERMAL_AND_IOMCU_EXPERIMENTS.md)
 - [`docs/BUILDS_A_B_CASE_STUDY.md`](docs/BUILDS_A_B_CASE_STUDY.md) — background, initial PX4/ArduPilot behavior and Builds A/B.
 - [`docs/BUILDS_A_B_RELEASE_NOTES.md`](docs/BUILDS_A_B_RELEASE_NOTES.md) — historical release instructions for A/B; download links there are placeholders until releases exist.
 - [`docs/BUILD_C_IOMCU_DIAGNOSTICS.md`](docs/BUILD_C_IOMCU_DIAGNOSTICS.md) — comprehensive implementation, build, boot safety, measurements, findings and uncertainty.
