@@ -1,0 +1,362 @@
+From 2092c87c6aed28e0c45580f0b061c2994d2923e7 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jos=C3=A9=20Carpio=20Ca=C3=B1ada?= <jose.carpio@gmail.com>
+Date: Sat, 17 Oct 2026 23:39:08 +0000
+Subject: [PATCH 2/2] Add Cube Orange IOMCU diagnostic probe
+
+---
+ ROMFS/px4fmu_common/init.d/rcS                |  11 +-
+ boards/cubepilot/cubeorange/rover.px4board    |   2 +-
+ .../include/px4_arch/px4io_serial.h           |   6 +
+ .../stm/stm32h7/px4io_serial/px4io_serial.cpp | 129 ++++++++++++------
+ src/drivers/px4io/px4io.cpp                   |  34 +++++
+ src/drivers/px4io/px4io_serial.cpp            |  25 ++--
+ 6 files changed, 154 insertions(+), 53 deletions(-)
+
+diff --git a/ROMFS/px4fmu_common/init.d/rcS b/ROMFS/px4fmu_common/init.d/rcS
+index 1337a777c8..a2685b1eaa 100644
+--- a/ROMFS/px4fmu_common/init.d/rcS
++++ b/ROMFS/px4fmu_common/init.d/rcS
+@@ -384,9 +384,10 @@ else
+ 	fi
+ 
+ 	#
+-	# px4io
++	# PX4IO disabled during Cube Orange IOMCU diagnostics (Build C).
++	# Do not check CRC, update firmware or start the normal driver.
+ 	#
+-	if px4io supported
++	if false
+ 	then
+ 	# Check if PX4IO present and update firmware if needed.
+ 		if [ -f $IOFW ]
+@@ -421,10 +422,8 @@ else
+ 
+ 	# Heater driver for temperature regulated IMUs.
+ 	# The heater needs to start after px4io.
+-	if param compare -s SENS_EN_THERMAL 1
+-	then
+-		heater start
+-	fi
++	# Build C: disable automatic heater driver startup.
++	# IOMCU thermal hardware state remains unknown.
+ 
+ 
+ 	#
+diff --git a/boards/cubepilot/cubeorange/rover.px4board b/boards/cubepilot/cubeorange/rover.px4board
+index ee14c06919..aa96462b5b 100644
+--- a/boards/cubepilot/cubeorange/rover.px4board
++++ b/boards/cubepilot/cubeorange/rover.px4board
+@@ -29,7 +29,7 @@ CONFIG_DRIVERS_PCA9685_PWM_OUT=y
+ CONFIG_DRIVERS_POWER_MONITOR_INA226=y
+ CONFIG_DRIVERS_PWM_INPUT=y
+ CONFIG_DRIVERS_PWM_OUT=y
+-# CONFIG_DRIVERS_PX4IO is not set
++CONFIG_DRIVERS_PX4IO=y
+ CONFIG_DRIVERS_HEATER=y
+ CONFIG_DRIVERS_SMART_BATTERY_BATMON=y
+ CONFIG_COMMON_TELEMETRY=y
+diff --git a/platforms/nuttx/src/px4/stm/stm32_common/include/px4_arch/px4io_serial.h b/platforms/nuttx/src/px4/stm/stm32_common/include/px4_arch/px4io_serial.h
+index bf33426d3c..eea2b9c2d2 100644
+--- a/platforms/nuttx/src/px4/stm/stm32_common/include/px4_arch/px4io_serial.h
++++ b/platforms/nuttx/src/px4/stm/stm32_common/include/px4_arch/px4io_serial.h
+@@ -66,6 +66,7 @@ protected:
+ 	 */
+ 	int		init(IOPacket *io_buffer);
+ 
++        bool _bus_sem_initialized{false};
+ 	/**
+ 	 * Start the transaction with IO and wait for it to complete.
+ 	 */
+@@ -96,6 +97,7 @@ private:
+ 	 */
+ 	IOPacket		*_io_buffer_ptr;
+ 
++
+ 	/** bus-ownership lock */
+ 	px4_sem_t			_bus_semaphore;
+ 
+@@ -129,6 +131,10 @@ private:
+ 	DMA_HANDLE		_tx_dma;
+ 	DMA_HANDLE		_rx_dma;
+ 
++        bool _uart_initialized{false};
++        bool _irq_attached{false};
++        bool _completion_sem_initialized{false};
++
+ 	IOPacket *_current_packet;
+ 
+ 	/** saved DMA status */
+diff --git a/platforms/nuttx/src/px4/stm/stm32h7/px4io_serial/px4io_serial.cpp b/platforms/nuttx/src/px4/stm/stm32h7/px4io_serial/px4io_serial.cpp
+index 3b97f834e0..4e9bad1fbd 100644
+--- a/platforms/nuttx/src/px4/stm/stm32h7/px4io_serial/px4io_serial.cpp
++++ b/platforms/nuttx/src/px4/stm/stm32h7/px4io_serial/px4io_serial.cpp
+@@ -110,40 +110,56 @@ ArchPX4IOSerial::ArchPX4IOSerial() :
+ {
+ }
+ 
++
+ ArchPX4IOSerial::~ArchPX4IOSerial()
+ {
+-	if (_tx_dma != nullptr) {
+-		stm32_dmastop(_tx_dma);
+-		stm32_dmafree(_tx_dma);
+-	}
+-
+-	if (_rx_dma != nullptr) {
+-		stm32_dmastop(_rx_dma);
+-		stm32_dmafree(_rx_dma);
+-	}
+-
+-	/* reset the UART */
+-	rCR1 = 0;
+-	rCR2 = 0;
+-	rCR3 = 0;
+-
+-	/* detach our interrupt handler */
+-	up_disable_irq(PX4IO_SERIAL_VECTOR);
+-	irq_detach(PX4IO_SERIAL_VECTOR);
+-
+-	/* restore the GPIOs */
+-	px4_arch_unconfiggpio(PX4IO_SERIAL_TX_GPIO);
+-	px4_arch_unconfiggpio(PX4IO_SERIAL_RX_GPIO);
+-
+-	/* Disable APB clock for the USART peripheral */
+-	modifyreg32(PX4IO_SERIAL_RCC_REG, PX4IO_SERIAL_RCC_EN, 0);
++    if (_uart_initialized) {
++        // Prevent further UART interrupts.
++        if (_irq_attached) {
++            up_disable_irq(PX4IO_SERIAL_VECTOR);
++            irq_detach(PX4IO_SERIAL_VECTOR);
++            _irq_attached = false;
++        }
++
++        // Disable UART and DMA requests.
++        rCR3 = 0;
++        rCR1 = 0;
++        rCR2 = 0;
++    }
++
++    // Stop and release allocated DMA channels.
++    if (_tx_dma != nullptr) {
++        stm32_dmastop(_tx_dma);
++        stm32_dmafree(_tx_dma);
++        _tx_dma = nullptr;
++    }
++
++    if (_rx_dma != nullptr) {
++        stm32_dmastop(_rx_dma);
++        stm32_dmafree(_rx_dma);
++        _rx_dma = nullptr;
++    }
++
++    if (_uart_initialized) {
++        px4_arch_unconfiggpio(PX4IO_SERIAL_TX_GPIO);
++        px4_arch_unconfiggpio(PX4IO_SERIAL_RX_GPIO);
++
++        modifyreg32(PX4IO_SERIAL_RCC_REG,
++                    PX4IO_SERIAL_RCC_EN, 0);
++
++        _uart_initialized = false;
++    }
++
++if (_completion_sem_initialized) {
++    px4_sem_destroy(&_completion_semaphore);
++    _completion_sem_initialized = false;
++}
+ 
+-	/* and kill our semaphores */
+-	px4_sem_destroy(&_completion_semaphore);
+ 
+-	perf_free(_pc_dmaerrs);
++    perf_free(_pc_dmaerrs);
+ }
+ 
++
+ int
+ ArchPX4IOSerial::init()
+ {
+@@ -154,6 +170,24 @@ ArchPX4IOSerial::init()
+ 		return r;
+ 	}
+ 
++
++/* Initialize completion semaphore before allocating DMA.
++ * This ensures it can be destroyed if DMA allocation fails.
++ */
++
++
++const int sem_ret = px4_sem_init(&_completion_semaphore, 0, 0);
++
++if (sem_ret != 0) {
++    PX4_ERR("PX4IO completion semaphore initialization failed");
++    return -1;
++}
++
++_completion_sem_initialized = true;
++px4_sem_setprotocol(&_completion_semaphore, SEM_PRIO_NONE);
++
++
++
+ 	/* allocate DMA */
+ 	_tx_dma = stm32_dmachannel(PX4IO_SERIAL_TX_DMAMAP);
+ 	_rx_dma = stm32_dmachannel(PX4IO_SERIAL_RX_DMAMAP);
+@@ -165,6 +199,8 @@ ArchPX4IOSerial::init()
+ 	/* Enable the APB clock for the USART peripheral */
+ 	modifyreg32(PX4IO_SERIAL_RCC_REG, 0, PX4IO_SERIAL_RCC_EN);
+ 
++        _uart_initialized = true;
++
+ 	/* configure pins for serial use */
+ 	px4_arch_configgpio(PX4IO_SERIAL_TX_GPIO);
+ 	px4_arch_configgpio(PX4IO_SERIAL_RX_GPIO);
+@@ -185,9 +221,20 @@ ArchPX4IOSerial::init()
+ 	uint32_t usartdiv32 = (PX4IO_SERIAL_CLOCK + (PX4IO_SERIAL_BITRATE) / 2) / (PX4IO_SERIAL_BITRATE);
+ 	rBRR = usartdiv32;
+ 
+-	/* attach serial interrupt handler */
+-	irq_attach(PX4IO_SERIAL_VECTOR, _interrupt, this);
+-	up_enable_irq(PX4IO_SERIAL_VECTOR);
++
++/* Attach the USART interrupt handler. */
++const int irq_ret = irq_attach(PX4IO_SERIAL_VECTOR, _interrupt, this);
++
++if (irq_ret < 0) {
++    PX4_ERR("PX4IO USART interrupt attachment failed: %d", irq_ret);
++    return irq_ret;
++}
++
++_irq_attached = true;
++
++up_enable_irq(PX4IO_SERIAL_VECTOR);
++
++
+ 
+ 	/* enable UART in DMA mode, enable error and line idle interrupts */
+ 	rCR3 = USART_CR3_EIE;
+@@ -196,12 +243,6 @@ ArchPX4IOSerial::init()
+ 	rCR1 = USART_CR1_RE | USART_CR1_TE | USART_CR1_UE | USART_CR1_IDLEIE;
+ 	/* TODO: maybe we need to adhere to the procedure as described in the reference manual page 1251 (34.5.2) */
+ 
+-	/* create semaphores */
+-	px4_sem_init(&_completion_semaphore, 0, 0);
+-
+-	/* _completion_semaphore use case is a signal */
+-
+-	px4_sem_setprotocol(&_completion_semaphore, SEM_PRIO_NONE);
+ 
+ 	/* XXX this could try talking to IO */
+ 
+@@ -263,7 +304,19 @@ ArchPX4IOSerial::ioctl(unsigned operation, unsigned &arg)
+ 		case 2:
+ 			syslog(LOG_INFO, "test 2\n");
+ 			return 0;
+-		}
++		} break;
++
++
++                case 100: { // Build C: print IOMCU communication diagnostics
++                        perf_print_counter(_pc_txns);
++                        perf_print_counter(_pc_retries);
++                        perf_print_counter(_pc_timeouts);
++                        perf_print_counter(_pc_crcerrs);
++                        perf_print_counter(_pc_dmaerrs);
++                        perf_print_counter(_pc_protoerrs);
++                        perf_print_counter(_pc_uerrs);
++                        return 0;
++                }
+ 
+ 	default:
+ 		break;
+diff --git a/src/drivers/px4io/px4io.cpp b/src/drivers/px4io/px4io.cpp
+index 0f53b54157..7bb98a4a23 100644
+--- a/src/drivers/px4io/px4io.cpp
++++ b/src/drivers/px4io/px4io.cpp
+@@ -1555,6 +1555,40 @@ int PX4IO::custom_command(int argc, char *argv[])
+ 		return 0;
+ 	}
+ 
++if (!strcmp(verb, "probe")) {
++    if (is_running()) {
++        PX4_ERR("PX4IO must be stopped");
++        return 1;
++    }
++
++    device::Device *interface = get_interface();
++
++    if (interface == nullptr) {
++        PX4_ERR("probe: interface initialization failed");
++        return 1;
++    }
++
++    uint16_t protocol = 0;
++    const unsigned address =
++        (PX4IO_PAGE_CONFIG << 8) | PX4IO_P_CONFIG_PROTOCOL_VERSION;
++
++    const int ret = interface->read(address, &protocol, 1);
++
++    if (ret == 1) {
++        PX4_INFO("IOMCU protocol version: %u", unsigned(protocol));
++    } else {
++        PX4_ERR("IOMCU communication failed: %d", ret);
++    }
++
++
++
++unsigned diagnostic_arg = 0;
++interface->ioctl(100, diagnostic_arg);
++
++    delete interface;
++    return ret == 1 ? 0 : 1;
++}
++
+ 	if (!strcmp(verb, "checkcrc")) {
+ 		if (is_running()) {
+ 			PX4_ERR("io must be stopped");
+diff --git a/src/drivers/px4io/px4io_serial.cpp b/src/drivers/px4io/px4io_serial.cpp
+index efb7065c35..28a5f45e9c 100644
+--- a/src/drivers/px4io/px4io_serial.cpp
++++ b/src/drivers/px4io/px4io_serial.cpp
+@@ -66,8 +66,12 @@ PX4IO_serial::PX4IO_serial() :
+ 
+ PX4IO_serial::~PX4IO_serial()
+ {
+-	/* kill our semaphores */
+-	px4_sem_destroy(&_bus_semaphore);
++
++/* Destroy the semaphore only if initialization succeeded. */
++if (_bus_sem_initialized) {
++    px4_sem_destroy(&_bus_semaphore);
++    _bus_sem_initialized = false;
++}
+ 
+ 	perf_free(_pc_txns);
+ 	perf_free(_pc_retries);
+@@ -86,14 +90,19 @@ PX4IO_serial::~PX4IO_serial()
+ int
+ PX4IO_serial::init(IOPacket *io_buffer)
+ {
+-	_io_buffer_ptr = io_buffer;
+-	/* create semaphores */
+-	// in case the sub-class impl fails, the semaphore is cleaned up by destructor.
+-	px4_sem_init(&_bus_semaphore, 0, 1);
++    _io_buffer_ptr = io_buffer;
+ 
+-	return 0;
+-}
++    const int ret = px4_sem_init(&_bus_semaphore, 0, 1);
+ 
++    if (ret != 0) {
++        PX4_ERR("PX4IO bus semaphore initialization failed");
++        return -1;
++    }
++
++    _bus_sem_initialized = true;
++
++    return 0;
++}
+ int
+ PX4IO_serial::write(unsigned address, void *data, unsigned count)
+ {
+-- 
+2.34.1
+
