@@ -43,8 +43,6 @@ The `DMA errors` counter is **not proof** of traffic from the IOMCU. Neither fai
 - [`docs/HARDWARE_DIAGNOSTIC_PLAN.md`](docs/HARDWARE_DIAGNOSTIC_PLAN.md) — conservative next steps; no invasive measurements without pinout verification.
 - [`docs/PUBLICATION_CHECKLIST.md`](docs/PUBLICATION_CHECKLIST.md) — attribution, source identity, evidence, releases and safety review.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — contribution and issue reporting guidance.
-- [Mac/UTM ARM64 Setup Guide](docs/YAHBOOM_MICROROS_V2_MAC_UTM_ARM64_SETUP.md) — for USB passthrough, Wi-Fi networking, ROS 2 Humble,
-micro-ROS Agent, camera integration, and LiDAR visualization.
 
 ## Source provenance
 
